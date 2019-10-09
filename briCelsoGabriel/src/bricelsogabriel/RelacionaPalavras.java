@@ -13,7 +13,6 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.regex.Pattern;
 
@@ -39,7 +38,7 @@ public class RelacionaPalavras {
     //essa classe sera utilizada como valor mapeado no hashMap globalWordCount
     class wordNode {//dada uma palavra em String, o mapa retorna 
         int ID;    //uma instancia de wordNode, contendo a dupla que indica
-        int count; //o ID da palavra, e quantas vezes ela ja foi encontrada no database
+        int count; //o ID da palavra, e em quantos documentos ela ja apareceu
         wordNode(int id, int count) {
             this.ID = id;
             this.count = count;
@@ -54,7 +53,7 @@ public class RelacionaPalavras {
         //estabelecendo conexao, criando novo statement, executando select com o novo statement
         //essas operacoes foram executadas no mesmo bloco try-with-resources
         //para aproveitar a implementação de AutoClosable
-        try(Connection conn = DriverManager.getConnection("jdbc:mysql://localhost:3306/bri?user=root&password=1234&useSSL=false&autoReconnect=true");
+        try(Connection conn = DriverManager.getConnection("jdbc:mysql://localhost:3306/bri?user=root&password=1234&useSSL=false&autoReconnect=true&rewriteBatchedStatements=true");
             Statement stmtSelectContent = conn.createStatement();
             ResultSet rs =  stmtSelectContent.executeQuery("SELECT id, text FROM content");){
              
@@ -67,7 +66,7 @@ public class RelacionaPalavras {
 
             Stemmenator st = new Stemmenator();
 
-            String insereStmtWord = "INSERT INTO word (id, word, ni) VALUES (?, ?, ?)";
+            String insereStmtWord = "INSERT INTO word (id, word, idf) VALUES (?, ?, ?)";
             String insereStmtRL = "INSERT INTO rlContentWord (contentId, wordId, fij) VALUES (?, ?, ?)";
 
             //para mehorar a performance dos executeBatch()
@@ -76,7 +75,7 @@ public class RelacionaPalavras {
 
             //padrao expressao regular pre compilado para comparar contra cada String encontrada
             //em cada texto presente na tabela content
-            String regexpAlfabeto = "[A-Za-z]+";
+            String regexpAlfabeto = "[A-Za-z]{3,}";
             Pattern padraoAlfabeto = Pattern.compile(regexpAlfabeto);
 
             int palavraCont = 0;
@@ -84,7 +83,7 @@ public class RelacionaPalavras {
 
             int intervalo = 2500;
             boolean hasNext = true;
-                
+            
             //esses PreparedStatements vao realizar os INSERTS
             //nas tabelas rlContentWord e word, respectivamente
             //pstmtInsereRL chama seu executeBatch() a cada "intervalo" paginas de content processadas
@@ -94,48 +93,48 @@ public class RelacionaPalavras {
                  PreparedStatement pstmtInsereWord = conn.prepareStatement(insereStmtWord);){
      
                 System.out.println("Batch RL sera executado a cada: "+intervalo+" entries da tabela content");
-                
                 while (hasNext) {
 
-                    int paginasProcessadas = 0;
-                    while ((hasNext = rs.next()) && paginasProcessadas++ < intervalo) {
+                    long start = System.nanoTime();
 
+                    int paginasProcessadas = 0;
+
+                    while ((hasNext = rs.next()) && paginasProcessadas++ < intervalo) {
+                        
                         int contentID = rs.getInt("id");
                         //mapeia quais palavras foram encontradas na pagina atual 
                         //de content, com quantas vezes cada uma ocorre
                         HashMap<Integer, Integer> pageWordCount = new HashMap();
-
+                        
                         //pega texto como armazenado na tabla content
-                        String dirtyText = new String(rs.getBytes("text"), "UTF-8");
+                        //String dirtyText = new String(rs.getBytes("text"), "UTF-8");
                         //tira tudo que nao eh alfanumerico e troca multiplos espacos por espaco singular
-                        String cleanText = dirtyText.replaceAll("\\s+", " ");
+                        //String cleanText = dirtyText.replaceAll("\\s+", " ");
                         //separa todas as palavras do texto limpo
-                        String[] palavras = cleanText.split(" ");
-
-                        for (String palavraAtual : palavras) {
+                        //String[] palavras = cleanText.split(" ");
+                        
+                        String[] texto = new String(rs.getBytes("text"), "UTF-8").replaceAll("\\s+", " ").split(" ");
+                        for (String palavraAtual : texto) {
                             //compara palavra atual com o padrao pre compilado anteriormente
                             //retorna false para toda String que contenha qualquer coisa diferente de [A-Za-z]+
                             if (padraoAlfabeto.matcher(palavraAtual).matches()) {
 
                                 palavraAtual = palavraAtual.toLowerCase();
                                 st.stem(palavraAtual);
-
-                                //caso a palavra atual nao tenha aparecido no db ate agora
-                                if (!globalWordCount.containsKey(palavraAtual)) {
-                                    palavraCont++;
-                                    //coloca a palavra no hashmap global
-                                    globalWordCount.put(palavraAtual, new wordNode(palavraCont, 0));
-                                }
+                                
+                                //coloca a palavra no hashmap global
+                                globalWordCount.putIfAbsent(palavraAtual, new wordNode(++palavraCont, 0));
+                                
                                 int wordID = globalWordCount.get(palavraAtual).getId();
-                                //adiciona uma ocorrencia dessa palavra no globalWorkCount
-                                globalWordCount.get(palavraAtual).novaOcorrencia();
-                                //caso a palavra atual nao tenha aparecido na entrada atual de content
-                                if (!pageWordCount.containsKey(wordID)) {
-                                    //insere em pageWordCount a aparicao dessa palavra na pagina atual
-                                    pageWordCount.put(wordID, 0);
+                                   
+                                //insere em pageWordCount a aparicao dessa palavra na pagina atual
+                                if(pageWordCount.putIfAbsent(wordID, 0) == null){
+                                    //palavraAtual apareceu em mais um documento
+                                    globalWordCount.get(palavraAtual).novaOcorrencia(); 
                                 }
+                                
                                 //atualiza o numero de ocorrencia da palavra na tabela atual
-                                pageWordCount.computeIfPresent(wordID, (k, v) -> v + 1);
+                                pageWordCount.compute(wordID, (k, v) -> v + 1);                   
                             }
                         }
                         //INSERT INTO rlContentWord (contentId, wordId, fij) VALUES (?, ?, ?)
@@ -144,23 +143,27 @@ public class RelacionaPalavras {
                             pstmtInsereRL.setInt(2, wordID);     //wordID
                             pstmtInsereRL.setInt(3, pageWordCount.get(wordID));//fij
                             pstmtInsereRL.addBatch();
-                        }                        
-                    }                
+                        }                      
+                    } 
+                    //System.out.println("Number of words found: "+palavraCont);
                     batchCount++;
                     System.out.println("Executing RL batch: " + batchCount);
                     pstmtInsereRL.executeBatch();
+                    pstmtInsereRL.clearBatch();
                     System.out.println("RL batch: " + batchCount + " -> completed");
+                    System.out.println(intervalo+" paginas processadas em: "+(System.nanoTime() - start)/1_000_000_000+"s");
                 }
                 System.out.println("rlContentWord populada por completo\n");
                 System.out.println(palavraCont + " palavras unicas encontradas");
             
-                //INSERT INTO rlContentWord (contentId, wordId, ni) VALUES (?, ?, ?)
+                //INSERT INTO word (contentId, wordId, idf) VALUES (?, ?, ?)
                 for (String palavra : globalWordCount.keySet()) {
                     pstmtInsereWord.setInt(1, globalWordCount.get(palavra).getId());//contentID
                     pstmtInsereWord.setBytes(2, palavra.getBytes());//word
-                    pstmtInsereWord.setInt(3, globalWordCount.get(palavra).getCount());//ni
+                    pstmtInsereWord.setInt(3, globalWordCount.get(palavra).getCount());//idf
                     pstmtInsereWord.addBatch();
                 }             
+
                 System.out.println("Executing Word Batch");
                 pstmtInsereWord.executeBatch();
                 System.out.println("word populada por completo");
